@@ -62,6 +62,7 @@ func (s *Server) Send(p payload.Payload) {
 // Wait for transfer to be completed, it waits forever if kept awlive
 func (s Server) Wait() error {
 	<-s.stopChannel
+	fmt.Println("收到停止信号")
 	if err := s.instance.Shutdown(context.Background()); err != nil {
 		log.Println(err)
 	}
@@ -125,6 +126,7 @@ func New(cfg *config.Config) (*Server, error) {
 	go func() {
 		<-sig
 		app.stopChannel <- true
+		log.Println("os.Interrupt,发送停止信号")
 	}()
 	// The handler adds and removes from the sync.WaitGroup
 	// When the group is zero all requests are completed
@@ -134,9 +136,37 @@ func New(cfg *config.Config) (*Server, error) {
 	var initCookie sync.Once
 	// Create handlers
 	// Send handler (sends file to caller)
-	http.HandleFunc("/send/"+path, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/send/"+path, sendHandler(cookie,initCookie,app,&waitgroup))
+	// Upload handler (serves the upload page)
+	http.HandleFunc("/receive/"+path, receiveHandler(path,app,cfg))
+	// Wait for all wg to be done, then send shutdown signal
+	go func() {
+		waitgroup.Wait()
+		log.Println("waitgroup完成了")
+		if cfg.KeepAlive || !app.expectParallelRequests {
+			return
+		}
+		app.stopChannel <- true
+	}()
+	// Receive handler (receives file from caller)
+	go func() {
+		if err := (httpserver.Serve(tcpKeepAliveListener{listener.(*net.TCPListener)})); err != http.ErrServerClosed {
+			log.Fatalln(err)
+		}
+	}()
+	app.instance = httpserver
+	return app, nil
+}
+
+func sendHandler(cookie http.Cookie, initCookie sync.Once, app *Server, waitgroup *sync.WaitGroup)func(http.ResponseWriter, *http.Request){
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Println("header: ", r.Header)
+		log.Println("agent: ",r.UserAgent())
+		log.Println("cookies: ",r.Cookies())
+		log.Println("cookie.Value = ", cookie.Value)
 		if cookie.Value == "" {
 			if !strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
+				log.Println("===,错误,",http.StatusOK)
 				http.Error(w, "", http.StatusOK)
 				return
 			}
@@ -166,12 +196,16 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 		// Remove connection from the waitfroup when done
 		defer waitgroup.Done()
-		w.Header().Set("Content-Disposition", "attachment; filename="+
-			app.payload.Filename)
+		w.Header().Set("Content-Disposition", "attachment; filename="+app.payload.Filename)
+		w.Header().Set("Expires", "0")
+		w.Header().Set("Cache-Control", "must-revalidate")
+		w.Header().Set("Pragma", "public")
 		http.ServeFile(w, r, app.payload.Path)
-	})
-	// Upload handler (serves the upload page)
-	http.HandleFunc("/receive/"+path, func(w http.ResponseWriter, r *http.Request) {
+		log.Println("send结束")
+	}
+}
+func receiveHandler(path string, app *Server, cfg *config.Config) func(http.ResponseWriter, *http.Request){
+	return func (w http.ResponseWriter, r *http.Request) {
 		htmlVariables := struct {
 			Route string
 			File  string
@@ -258,21 +292,5 @@ func New(cfg *config.Config) (*Server, error) {
 		case "GET":
 			serveTemplate("upload", pages.Upload, w, htmlVariables)
 		}
-	})
-	// Wait for all wg to be done, then send shutdown signal
-	go func() {
-		waitgroup.Wait()
-		if cfg.KeepAlive || !app.expectParallelRequests {
-			return
-		}
-		app.stopChannel <- true
-	}()
-	// Receive handler (receives file from caller)
-	go func() {
-		if err := (httpserver.Serve(tcpKeepAliveListener{listener.(*net.TCPListener)})); err != http.ErrServerClosed {
-			log.Fatalln(err)
-		}
-	}()
-	app.instance = httpserver
-	return app, nil
+	}
 }
