@@ -62,7 +62,7 @@ func (s *Server) Send(p payload.Payload) {
 // Wait for transfer to be completed, it waits forever if kept awlive
 func (s Server) Wait() error {
 	<-s.stopChannel
-	fmt.Println("收到停止信号")
+	log.Println("收到停止信号, 进程将要退出了")
 	if err := s.instance.Shutdown(context.Background()); err != nil {
 		log.Println(err)
 	}
@@ -128,27 +128,14 @@ func New(cfg *config.Config) (*Server, error) {
 		app.stopChannel <- true
 		log.Println("os.Interrupt,发送停止信号")
 	}()
-	// The handler adds and removes from the sync.WaitGroup
-	// When the group is zero all requests are completed
-	// and the server is shutdown
-	var waitgroup sync.WaitGroup
-	waitgroup.Add(1)
+
 	var initCookie sync.Once
 	// Create handlers
 	// Send handler (sends file to caller)
-	http.HandleFunc("/send/"+path, sendHandler(cookie,initCookie,app,&waitgroup))
+	http.HandleFunc("/send/"+path, sendHandler(cookie,initCookie,app,cfg))
 	// Upload handler (serves the upload page)
 	http.HandleFunc("/receive/"+path, receiveHandler(path,app,cfg))
-	// Wait for all wg to be done, then send shutdown signal
-	go func() {
-		waitgroup.Wait()
-		log.Println("waitgroup完成了")
-		if cfg.KeepAlive || !app.expectParallelRequests {
-			return
-		}
-		app.stopChannel <- true
-	}()
-	// Receive handler (receives file from caller)
+
 	go func() {
 		if err := (httpserver.Serve(tcpKeepAliveListener{listener.(*net.TCPListener)})); err != http.ErrServerClosed {
 			log.Fatalln(err)
@@ -158,7 +145,7 @@ func New(cfg *config.Config) (*Server, error) {
 	return app, nil
 }
 
-func sendHandler(cookie http.Cookie, initCookie sync.Once, app *Server, waitgroup *sync.WaitGroup)func(http.ResponseWriter, *http.Request){
+func sendHandler(cookie http.Cookie, initCookie sync.Once, app *Server, cfg *config.Config)func(http.ResponseWriter, *http.Request){
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Println("header: ", r.Header)
 		log.Println("agent: ",r.UserAgent())
@@ -166,8 +153,9 @@ func sendHandler(cookie http.Cookie, initCookie sync.Once, app *Server, waitgrou
 		log.Println("cookie.Value = ", cookie.Value)
 		if cookie.Value == "" {
 			if !strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
-				log.Println("===,错误,",http.StatusOK)
-				http.Error(w, "", http.StatusOK)
+				log.Println("错误的User-Agent, 没有以Mozilla开头")
+				http.Error(w, "", http.StatusBadRequest)
+				app.stopChannel<-true
 				return
 			}
 			initCookie.Do(func() {
@@ -186,22 +174,20 @@ func sendHandler(cookie http.Cookie, initCookie sync.Once, app *Server, waitgrou
 			// return a 404 status
 			rcookie, err := r.Cookie(cookie.Name)
 			if err != nil || rcookie.Value != cookie.Value {
+				log.Printf("cookie不一致或者发生错误,err = `%+v`",err)
 				http.Error(w, "", http.StatusNotFound)
 				return
 			}
-			// If the cookie exits and matches
-			// this is an aadditional request.
-			// Increment the waitgroup
-			waitgroup.Add(1)
 		}
-		// Remove connection from the waitfroup when done
-		defer waitgroup.Done()
 		w.Header().Set("Content-Disposition", "attachment; filename="+app.payload.Filename)
 		w.Header().Set("Expires", "0")
 		w.Header().Set("Cache-Control", "must-revalidate")
 		w.Header().Set("Pragma", "public")
 		http.ServeFile(w, r, app.payload.Path)
-		log.Println("send结束")
+		log.Println("sendHandler结束")
+		if !cfg.KeepAlive || !app.expectParallelRequests {
+			app.stopChannel<-true
+		}
 	}
 }
 func receiveHandler(path string, app *Server, cfg *config.Config) func(http.ResponseWriter, *http.Request){
